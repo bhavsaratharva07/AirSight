@@ -10,6 +10,10 @@ const WAQI_TOKEN = "13f4e896d25ecf8d002f8e194cb5aba1eeee609f";
 // from being displayed. When all of a city's stations are stale, the app falls
 // back to live Open-Meteo automatically.
 const MAX_STATION_AGE_H = 3;
+// IQAir (AirVisual) free Community key — accurate LIVE ground-referenced AQI,
+// used to anchor cities that have no live WAQI ground stations (e.g. Pune).
+// Like the WAQI token this lives client-side; the free key is rate-limited.
+const IQAIR_KEY = "f43b4e7c-13a9-4ab6-9a94-2175970ae175";
 const CITIES = {
   delhi: {
     name: "Delhi", lat: 28.6139, lon: 77.2090,
@@ -111,6 +115,20 @@ function subIndex(conc, table){
     if (conc >= Clo && conc <= Chi) return Math.round(((Ihi-Ilo)/(Chi-Clo))*(conc-Clo)+Ilo);
   }
   return 500;
+}
+
+// ---- US EPA breakpoints, used to INVERT an IQAir US-AQI back into a µg/m³
+//      concentration (the free IQAir tier returns AQI, not concentration). ----
+const US = {
+  p2: [[0,50,0.0,12.0],[51,100,12.1,35.4],[101,150,35.5,55.4],[151,200,55.5,150.4],[201,300,150.5,250.4],[301,500,250.5,500.4]],
+  p1: [[0,50,0,54],[51,100,55,154],[101,150,155,254],[151,200,255,354],[201,300,355,424],[301,500,425,604]]
+};
+function usAqiToConc(aqi, mainus){
+  const tbl = (mainus === "p1") ? US.p1 : US.p2;   // p2=PM2.5 (default), p1=PM10
+  for (const [Ilo,Ihi,Clo,Chi] of tbl){
+    if (aqi >= Ilo && aqi <= Ihi) return Math.round(((Chi-Clo)/(Ihi-Ilo))*(aqi-Ilo)+Clo);
+  }
+  return null;
 }
 
 // ---- state ----
@@ -217,13 +235,13 @@ async function loadCity(key){
       source = "WAQI (CPCB/SAFAR)";
       setStatus("live", source);
     } catch (e) {
-      console.warn("WAQI failed/stale, using Open-Meteo:", e);
-      // Prefer LIVE per-station data (real map markers) when we know the
-      // station coordinates; otherwise fall back to a single city-wide point.
+      console.warn("WAQI failed/stale, using live fallback:", e);
+      // Accurate ground-truth anchor (IQAir) — best-effort; used to bias-correct the model.
+      const gt = await fetchIQAirGroundTruth(c).catch(err => { console.warn("IQAir anchor unavailable:", err); return null; });
       if (c.stationCoords && c.stationCoords.length){
-        const res = await fetchOpenMeteoStations(c);
+        const res = await fetchOpenMeteoStations(c, gt);   // anchored to IQAir when available
         primary = res.primary; stations = res.stations;
-        source = "Open-Meteo (live, per-station)";
+        source = gt ? "IQAir ground-truth + Open-Meteo (per-station)" : "Open-Meteo (live, per-station)";
       } else {
         primary = await fetchOpenMeteo(c);
         stations = [];
@@ -366,28 +384,60 @@ async function fetchOpenMeteo(c){
   };
 }
 
+// IQAir ground truth: accurate live reading near the city centre. Returns the
+// main-pollutant concentration (µg/m³) so we can anchor the model to reality.
+async function fetchIQAirGroundTruth(c){
+  if (!IQAIR_KEY || IQAIR_KEY.indexOf("PASTE") === 0) return null;
+  const url = `https://api.airvisual.com/v2/nearest_city?lat=${c.lat}&lon=${c.lon}&key=${IQAIR_KEY}`;
+  const j = await fetchJSON(url, 8000);
+  if (!j || j.status !== "success") throw new Error("IQAir failed");
+  const p = j.data.current.pollution;
+  const conc = usAqiToConc(p.aqius, p.mainus);
+  return {
+    aqius: p.aqius, mainus: p.mainus, station: j.data.city,
+    pm25: (p.mainus === "p1") ? null : conc,
+    pm10: (p.mainus === "p1") ? conc : null
+  };
+}
+
 // Open-Meteo PER-STATION: live values at each real station coordinate.
 // Builds a full multi-marker map for cities without live WAQI ground stations.
-async function fetchOpenMeteoStations(c){
+// If `gt` (IQAir ground truth) is supplied, the model values are bias-corrected
+// to match the real ground reading — accurate absolute levels AND hyperlocal spread.
+async function fetchOpenMeteoStations(c, gt){
   const lats = c.stationCoords.map(s => s.lat).join(",");
   const lons = c.stationCoords.map(s => s.lon).join(",");
   const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lats}&longitude=${lons}`
             + `&hourly=pm2_5,pm10,nitrogen_dioxide,ozone&forecast_days=5&timezone=auto`;
   const j = await fetchJSON(url, 9000);
   const arr = Array.isArray(j) ? j : [j];   // Open-Meteo returns an array for multi-location
+
+  // --- work out the ground-truth anchor factor (model -> reality) ---
+  const raw = arr.map((it, k) => ({ meta: c.stationCoords[k], h: it && it.hourly }))
+                 .filter(x => x.meta && x.h && x.h.pm2_5);
+  let factor = 1;
+  if (gt && (gt.pm25 != null || gt.pm10 != null) && raw.length){
+    // model value at the station nearest the city centre
+    let central = raw[0], best = Infinity;
+    for (const x of raw){ const dd = dist(x.meta.lat, x.meta.lon, c.lat, c.lon); if (dd < best){ best = dd; central = x; } }
+    let ci = central.h.pm2_5.length - 1;
+    while (ci > 0 && central.h.pm2_5[ci] == null) ci--;
+    const modelPm25 = central.h.pm2_5[ci];
+    const gtPm25 = gt.pm25 != null ? gt.pm25 : gt.pm10;   // fall back to pm10 if pm2.5 absent
+    if (modelPm25 && gtPm25) factor = Math.max(0.25, Math.min(8, gtPm25 / modelPm25));
+  }
+
   const stations = [];
-  arr.forEach((it, k) => {
-    const meta = c.stationCoords[k];
-    const h = it && it.hourly;
-    if (!meta || !h || !h.pm2_5) return;
+  raw.forEach(({meta, h}) => {
     let idx = h.time.length - 1;
     while (idx > 0 && h.pm2_5[idx] == null) idx--;
-    const pm25 = h.pm2_5[idx], pm10 = h.pm10[idx];
+    const pm25 = h.pm2_5[idx] != null ? h.pm2_5[idx] * factor : null;
+    const pm10 = h.pm10[idx]  != null ? h.pm10[idx]  * factor : null;
     const i25 = subIndex(pm25, BP.pm25), i10 = subIndex(pm10, BP.pm10);
     const aqi = Math.max(i25 || 0, i10 || 0);
-    // per-day average pm2.5 forecast for this station
+    // per-day average pm2.5 forecast for this station (also anchored)
     const byDay = {};
-    h.time.forEach((t,i) => { if (h.pm2_5[i]==null) return; (byDay[t.slice(0,10)] = byDay[t.slice(0,10)] || []).push(h.pm2_5[i]); });
+    h.time.forEach((t,i) => { if (h.pm2_5[i]==null) return; (byDay[t.slice(0,10)] = byDay[t.slice(0,10)] || []).push(h.pm2_5[i]*factor); });
     const forecast = Object.keys(byDay).slice(0,5).map(day => {
       const a = byDay[day];
       return { day, avg: Math.round(a.reduce((x,y)=>x+y,0)/a.length), min: Math.round(Math.min(...a)), max: Math.round(Math.max(...a)) };

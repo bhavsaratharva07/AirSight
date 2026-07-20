@@ -5,6 +5,11 @@
 
 // ---- CONFIG: add more cities by copying an entry here ----
 const WAQI_TOKEN = "13f4e896d25ecf8d002f8e194cb5aba1eeee609f";
+// Data-freshness guard: ignore any station whose last reading is older than this
+// many hours. Prevents stale feeds (e.g. WAQI's Pune stations frozen since 2021)
+// from being displayed. When all of a city's stations are stale, the app falls
+// back to live Open-Meteo automatically.
+const MAX_STATION_AGE_H = 3;
 const CITIES = {
   delhi: {
     name: "Delhi", lat: 28.6139, lon: 77.2090,
@@ -21,6 +26,33 @@ const CITIES = {
       { name: "St. Columba's School", type: "school", lat: 28.6360, lon: 77.2065 },
       { name: "Modern School, Barakhamba", type: "school", lat: 28.6280, lon: 77.2270 },
       { name: "DAV School, Anand Vihar", type: "school", lat: 28.6510, lon: 77.3080 }
+    ],
+    // real CPCB station coordinates — used to build LIVE per-station data from
+    // Open-Meteo whenever WAQI has no fresh ground stations for this city.
+    stationCoords: [
+      { name: "Narela", lat: 28.8206, lon: 77.1011 },
+      { name: "DITE Okhla", lat: 28.5313, lon: 77.2707 },
+      { name: "Major Dhyan Chand National Stadium", lat: 28.6125, lon: 77.2374 },
+      { name: "PGDAV College", lat: 28.5668, lon: 77.2514 },
+      { name: "ITI Shahdra", lat: 28.6721, lon: 77.3138 },
+      { name: "Satyawati College", lat: 28.6957, lon: 77.1813 },
+      { name: "Sonia Vihar Water Treatment Plant DJB", lat: 28.7101, lon: 77.2462 },
+      { name: "Shaheed Sukhdev College of Business Studies", lat: 28.7327, lon: 77.1188 },
+      { name: "Jawaharlal Nehru Stadium", lat: 28.5828, lon: 77.2344 },
+      { name: "Pusa", lat: 28.637, lon: 77.1722 },
+      { name: "ITI Jahangirpuri", lat: 28.733, lon: 77.172 },
+      { name: "Punjabi Bagh", lat: 28.6683, lon: 77.1167 },
+      { name: "Dr. Karni Singh Shooting Range", lat: 28.4997, lon: 77.2671 },
+      { name: "Sri Auribindo Marg", lat: 28.5283, lon: 77.1893 },
+      { name: "Anand Vihar", lat: 28.6508, lon: 77.3152 },
+      { name: "Mandir Marg", lat: 28.6341, lon: 77.2005 },
+      { name: "Bramprakash Ayurvedic Hospital", lat: 28.5727, lon: 76.9334 },
+      { name: "Mundka", lat: 28.6824, lon: 77.0305 },
+      { name: "Alipur", lat: 28.8157, lon: 77.1525 },
+      { name: "R.K. Puram", lat: 28.5648, lon: 77.1744 },
+      { name: "Mother Dairy Plant", lat: 28.6202, lon: 77.2877 },
+      { name: "National Institute of Malaria Research", lat: 28.5769, lon: 77.0759 },
+      { name: "Delhi Institute of Tool Engineering", lat: 28.7005, lon: 77.1656 }
     ]
   },
   pune: {
@@ -34,6 +66,21 @@ const CITIES = {
       { name: "Fergusson College", type: "school", lat: 18.5236, lon: 73.8410 },
       { name: "Symbiosis School", type: "school", lat: 18.5390, lon: 73.8320 },
       { name: "Loyola High School", type: "school", lat: 18.5175, lon: 73.8280 }
+    ],
+    // real CPCB station coordinates — used to build LIVE per-station data from
+    // Open-Meteo (WAQI has no fresh Pune ground stations).
+    stationCoords: [
+      { name: "Shivajinagar", lat: 18.5296, lon: 73.8496 },
+      { name: "Katraj", lat: 18.4599, lon: 73.8523 },
+      { name: "Pashan", lat: 18.5364, lon: 73.8055 },
+      { name: "Lohegaon", lat: 18.5779, lon: 73.9081 },
+      { name: "Karve Road", lat: 18.4975, lon: 73.8135 },
+      { name: "Hadapsar", lat: 18.5022, lon: 73.9275 },
+      { name: "Nigdi", lat: 18.6617, lon: 73.7623 },
+      { name: "Alandi", lat: 18.6737, lon: 73.8915 },
+      { name: "Manjri", lat: 18.5268, lon: 73.975 },
+      { name: "Bhosari", lat: 18.6421, lon: 73.8491 },
+      { name: "Bhumkar Chowk", lat: 18.6062, lon: 73.75 }
     ]
   }
 };
@@ -170,10 +217,18 @@ async function loadCity(key){
       source = "WAQI (CPCB/SAFAR)";
       setStatus("live", source);
     } catch (e) {
-      console.warn("WAQI failed, using Open-Meteo:", e);
-      primary = await fetchOpenMeteo(c);    // may throw -> caught below
-      stations = [];
-      source = "Open-Meteo (computed)";
+      console.warn("WAQI failed/stale, using Open-Meteo:", e);
+      // Prefer LIVE per-station data (real map markers) when we know the
+      // station coordinates; otherwise fall back to a single city-wide point.
+      if (c.stationCoords && c.stationCoords.length){
+        const res = await fetchOpenMeteoStations(c);
+        primary = res.primary; stations = res.stations;
+        source = "Open-Meteo (live, per-station)";
+      } else {
+        primary = await fetchOpenMeteo(c);
+        stations = [];
+        source = "Open-Meteo (live, city-wide)";
+      }
       setStatus("fallback", source);
     }
     const wind = await windP;
@@ -216,6 +271,17 @@ function dist(a,b,c,d){ return Math.hypot(a-c, b-d); }
 // Parse a WAQI station feed (data object) into our record shape.
 function parseStationFeed(d){
   if (!d || typeof d.aqi !== "number") return null;
+  // --- freshness guard: drop stations whose reading is too old ---
+  const tRaw = d.time && (d.time.iso || d.time.s);
+  const tMs  = tRaw ? Date.parse(tRaw)
+                    : (d.time && d.time.v ? d.time.v * 1000 : NaN);
+  if (!isNaN(tMs)){
+    const ageH = (Date.now() - tMs) / 3.6e6;
+    if (ageH > MAX_STATION_AGE_H){
+      console.warn(`Skipping stale station "${(d.city&&d.city.name)||"?"}" — ${ageH.toFixed(1)}h old`);
+      return null;
+    }
+  }
   const io = d.iaqi || {};
   const val = k => io[k] && typeof io[k].v === "number" ? Math.round(io[k].v) : null;
   let forecast = [];
@@ -298,6 +364,48 @@ async function fetchOpenMeteo(c){
     o3: h.ozone?.[idx]!=null?Math.round(h.ozone[idx]):null,
     forecast
   };
+}
+
+// Open-Meteo PER-STATION: live values at each real station coordinate.
+// Builds a full multi-marker map for cities without live WAQI ground stations.
+async function fetchOpenMeteoStations(c){
+  const lats = c.stationCoords.map(s => s.lat).join(",");
+  const lons = c.stationCoords.map(s => s.lon).join(",");
+  const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lats}&longitude=${lons}`
+            + `&hourly=pm2_5,pm10,nitrogen_dioxide,ozone&forecast_days=5&timezone=auto`;
+  const j = await fetchJSON(url, 9000);
+  const arr = Array.isArray(j) ? j : [j];   // Open-Meteo returns an array for multi-location
+  const stations = [];
+  arr.forEach((it, k) => {
+    const meta = c.stationCoords[k];
+    const h = it && it.hourly;
+    if (!meta || !h || !h.pm2_5) return;
+    let idx = h.time.length - 1;
+    while (idx > 0 && h.pm2_5[idx] == null) idx--;
+    const pm25 = h.pm2_5[idx], pm10 = h.pm10[idx];
+    const i25 = subIndex(pm25, BP.pm25), i10 = subIndex(pm10, BP.pm10);
+    const aqi = Math.max(i25 || 0, i10 || 0);
+    // per-day average pm2.5 forecast for this station
+    const byDay = {};
+    h.time.forEach((t,i) => { if (h.pm2_5[i]==null) return; (byDay[t.slice(0,10)] = byDay[t.slice(0,10)] || []).push(h.pm2_5[i]); });
+    const forecast = Object.keys(byDay).slice(0,5).map(day => {
+      const a = byDay[day];
+      return { day, avg: Math.round(a.reduce((x,y)=>x+y,0)/a.length), min: Math.round(Math.min(...a)), max: Math.round(Math.max(...a)) };
+    });
+    stations.push({
+      name: meta.name, lat: meta.lat, lon: meta.lon, aqi,
+      dominant: (i25 >= i10) ? "PM2.5" : "PM10",
+      pm25: pm25!=null?Math.round(pm25):null, pm10: pm10!=null?Math.round(pm10):null,
+      no2: h.nitrogen_dioxide?.[idx]!=null?Math.round(h.nitrogen_dioxide[idx]):null,
+      o3: h.ozone?.[idx]!=null?Math.round(h.ozone[idx]):null,
+      forecast
+    });
+  });
+  if (!stations.length) throw new Error("Open-Meteo per-station: no data");
+  // primary = station closest to the city centre (for the hero card + forecast)
+  let primary = stations[0], best = Infinity;
+  for (const s of stations){ const dd = dist(s.lat, s.lon, c.lat, c.lon); if (dd < best){ best = dd; primary = s; } }
+  return { primary, stations };
 }
 
 /* ============================ RENDER ============================ */

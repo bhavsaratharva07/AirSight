@@ -14,6 +14,9 @@ const MAX_STATION_AGE_H = 3;
 // used to anchor cities that have no live WAQI ground stations (e.g. Pune).
 // Like the WAQI token this lives client-side; the free key is rate-limited.
 const IQAIR_KEY = "f43b4e7c-13a9-4ab6-9a94-2175970ae175";
+// AQI at/above which a station/zone is flagged for intervention.
+// 101 = start of the "Moderate" band (was 201 = "Poor").
+const INTERVENTION_MIN_AQI = 101;
 const CITIES = {
   delhi: {
     name: "Delhi", lat: 28.6139, lon: 77.2090,
@@ -624,6 +627,12 @@ function actionFor(band, source){
   const dust = source.includes("dust");
   const veh  = source.includes("Vehic") || source.includes("Traffic");
   const ind  = source.includes("Industrial");
+  if (band.name === "Moderate") {
+    if (dust) return "Preventive dust control: water sprinkling & dust-screen checks at nearby construction/roadworks.";
+    if (veh)  return "Preventive PUC (emission) checks on busy corridors; ease congestion via signal re-timing.";
+    if (ind)  return "Advisory notice to nearby industrial units; verify emission controls are active.";
+    return "Early preventive action: localised dust suppression + traffic-emission checks; advise sensitive groups.";
+  }
   if (band.name === "Poor") {
     if (dust) return "Deploy water sprinklers & cover exposed soil at nearby construction sites; enforce dust-screen norms.";
     if (veh)  return "Intensify PUC (emission) checks on arterial roads; ease congestion via signal re-timing.";
@@ -646,9 +655,9 @@ function actionFor(band, source){
 // Build a prioritized intervention list from live hotspot stations.
 function computeInterventions(c, stations, primary, wind){
   const RADIUS = 3; // km — receptors considered "impacted"
-  let hotspots = (stations || []).filter(s => typeof s.aqi === "number" && s.aqi >= 201);
+  let hotspots = (stations || []).filter(s => typeof s.aqi === "number" && s.aqi >= INTERVENTION_MIN_AQI);
   // if no station-level hotspots but city AQI is high, synthesize a city-level card
-  if (!hotspots.length && primary && primary.aqi >= 201){
+  if (!hotspots.length && primary && primary.aqi >= INTERVENTION_MIN_AQI){
     hotspots = [{ name: c.name + " (city avg)", aqi: primary.aqi, lat: c.lat, lon: c.lon, dominant: primary.dominant }];
   }
   hotspots.sort((a,b) => b.aqi - a.aqi);
@@ -665,7 +674,10 @@ function computeInterventions(c, stations, primary, wind){
     }
     const schools = sites.filter(s => s.type === "school").length;
     const hospitals = sites.filter(s => s.type === "hospital").length;
-    const eta = band.name === "Severe" ? "Immediate (< 1 hr)" : band.name === "Very Poor" ? "< 2 hrs" : "< 6 hrs";
+    const eta = band.name === "Severe" ? "Immediate (< 1 hr)"
+              : band.name === "Very Poor" ? "< 2 hrs"
+              : band.name === "Poor" ? "< 6 hrs"
+              : "< 12 hrs (preventive)";
     return {
       loc: h.name, aqi: h.aqi, band, source,
       sites: sites.slice(0,3), schools, hospitals,
@@ -680,7 +692,7 @@ function renderActionConsole(c, stations, primary, wind){
   if (!box) return;
   const items = computeInterventions(c, stations, primary, wind);
   if (!items.length){
-    box.innerHTML = `<div class="action-ok">✅ No zones above the <strong>Poor</strong> threshold right now.
+    box.innerHTML = `<div class="action-ok">✅ No zones above the <strong>Moderate</strong> threshold right now.
       All monitored areas are within acceptable limits — continue routine monitoring.</div>`;
     return;
   }
